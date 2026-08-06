@@ -1,0 +1,26 @@
+# Checklist Fitur TB Bisma
+
+- [x] Dashboard
+- [x] Data barang awal 430 item
+- [x] Tambah/edit/nonaktifkan barang
+- [x] Foto produk kamera/galeri + kompres otomatis
+- [x] Satuan fleksibel, alias, harga grosir, favorit
+- [x] Kasir, autosave keranjang, transaksi pending
+- [x] Stok otomatis berkurang
+- [x] Pembatalan transaksi mengembalikan stok
+- [x] Stok masuk dan riwayat perubahan
+- [x] Piutang/bon, cicilan, status lunas
+- [x] Pajangan QRIS, SeaBank, DANA
+- [x] Supplier dan pesanan supplier
+- [x] Pengeluaran toko
+- [x] Retur penjualan/supplier
+- [x] Stok opname
+- [x] Pelanggan dan permintaan barang
+- [x] Tutup kas harian
+- [x] Nilai stok, profit, pemeriksaan data
+- [x] Backup/pulihkan JSON
+- [x] Import/export Excel
+- [x] Log aktivitas
+- [x] Responsif HP/tablet/komputer
+- [x] Penyimpanan offline IndexedDB
+- [x] Logo dan splash TB Bisma
