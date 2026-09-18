@@ -1,6 +1,7 @@
 import './style.css';
 import * as XLSX from 'xlsx';
 import seedProducts from './seed-products.json';
+import { ensureV2State, installV2 } from './v2.js';
 
 const DB='tb-bisma-db', STORE='app', KEY='state';
 const initial=()=>({version:1,products:seedProducts,transactions:[],debts:[],suppliers:[],expenses:[],returns:[],stockLogs:[],orders:[],customers:[],requests:[],cashClosings:[],pendingCarts:[],activity:[],settings:{store:'TB Bisma',dana:'085198580017',seabank:'901869157871',owner:'BISMA PUTRA RASTIKA'},cart:[]});
@@ -11,7 +12,7 @@ const now=()=>new Date().toISOString();
 const date=v=>v?new Date(v).toLocaleString('id-ID'):'-';
 
 function dbOpen(){return new Promise((res,rej)=>{const r=indexedDB.open(DB,1);r.onupgradeneeded=()=>r.result.createObjectStore(STORE);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)})}
-async function load(){const db=await dbOpen();state=await new Promise((res,rej)=>{const r=db.transaction(STORE).objectStore(STORE).get(KEY);r.onsuccess=()=>res(r.result||initial());r.onerror=()=>rej(r.error)});render()}
+async function load(){const db=await dbOpen();state=await new Promise((res,rej)=>{const r=db.transaction(STORE).objectStore(STORE).get(KEY);r.onsuccess=()=>res(r.result||initial());r.onerror=()=>rej(r.error)});ensureV2State(state);render()}
 async function save(msg){const db=await dbOpen();await new Promise((res,rej)=>{const r=db.transaction(STORE,'readwrite').objectStore(STORE).put(state,KEY);r.onsuccess=res;r.onerror=()=>rej(r.error)});if(msg)toast(msg)}
 function log(action){state.activity.unshift({id:uid('log'),at:now(),action});state.activity=state.activity.slice(0,1000)}
 function toast(t){const e=document.createElement('div');e.className='toast';e.textContent=t;document.body.append(e);setTimeout(()=>e.remove(),2200)}
@@ -83,4 +84,10 @@ function compressImage(file){return new Promise(res=>{let im=new Image(),r=new F
 function download(blob,name){let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 document.addEventListener('input',e=>{if(e.target.id==='search'){query=e.target.value;views.products&&render()}});
 window.addEventListener('error',e=>{console.error(e.error);toast('Terjadi kesalahan. Data tetap aman.');});
+installV2({
+  views, actions, nav,
+  getState:()=>state,
+  save, render,
+  helpers:{money,date,esc,title,btn,table,modal,val,uid,now,log,activeProducts}
+});
 load();
