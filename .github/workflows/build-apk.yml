@@ -2,7 +2,7 @@ name: Build APK TB Bisma
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ main, tb-bisma-v2 ]
 jobs:
   build:
     runs-on: ubuntu-latest
