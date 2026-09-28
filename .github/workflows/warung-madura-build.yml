@@ -29,7 +29,7 @@ jobs:
           rm -rf build_app decoded_src
           flutter create build_app --platforms=android --org id.bisma --project-name warung_madura
           mkdir -p decoded_src
-          base64 -d warung_madura_build/source.tar.gz.b64 > /tmp/source.tar.gz
+          cat warung_madura_build/source.part.*.b64 | base64 -d > /tmp/source.tar.gz
           tar -xzf /tmp/source.tar.gz -C decoded_src
           cp decoded_src/pubspec.yaml build_app/pubspec.yaml
           cp decoded_src/analysis_options.yaml build_app/analysis_options.yaml
