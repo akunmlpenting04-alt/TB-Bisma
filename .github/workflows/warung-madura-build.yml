@@ -71,9 +71,9 @@ jobs:
               "class AuditPage",
               "class _Line",
           ]:
-              needle = "}\\n}\\n\\n" + next_class
+              needle = "}\n}\n\n" + next_class
               if needle in s:
-                  s = s.replace(needle, "}\\n\\n" + next_class, 1)
+                  s = s.replace(needle, "}\n\n" + next_class, 1)
 
           p.write_text(s)
           PY
