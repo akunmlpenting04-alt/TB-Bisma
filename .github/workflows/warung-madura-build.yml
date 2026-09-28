@@ -6,6 +6,12 @@ on:
     paths:
       - 'warung_madura_build/**'
       - '.github/workflows/warung-madura-build.yml'
+  push:
+    branches:
+      - warung-madura-build-20260928
+    paths:
+      - 'warung_madura_build/**'
+      - '.github/workflows/warung-madura-build.yml'
 
 jobs:
   build:
