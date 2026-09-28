@@ -1,0 +1,97 @@
+name: Build WARUNG MADURA APK
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'warung_madura_build/**'
+      - '.github/workflows/warung-madura-build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare Flutter project
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf build_app decoded_src
+          flutter create build_app --platforms=android --org id.bisma --project-name warung_madura
+          mkdir -p decoded_src
+          base64 -d warung_madura_build/source.tar.gz.b64 > /tmp/source.tar.gz
+          tar -xzf /tmp/source.tar.gz -C decoded_src
+          cp decoded_src/pubspec.yaml build_app/pubspec.yaml
+          cp decoded_src/analysis_options.yaml build_app/analysis_options.yaml
+          rm -rf build_app/lib build_app/test
+          cp -R decoded_src/lib build_app/lib
+          cp -R decoded_src/test build_app/test
+          cp decoded_src/README.md build_app/README.md
+          sed -i 's/android:label="warung_madura"/android:label="Warung Madura"/' build_app/android/app/src/main/AndroidManifest.xml || true
+
+      - name: Apply premium Android launcher icon
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p build_app/android/app/src/main/res/drawable build_app/android/app/src/main/res/mipmap-anydpi-v26 build_app/android/app/src/main/res/values
+          cat > build_app/android/app/src/main/res/drawable/ic_launcher_foreground.xml <<'XML'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+            <path android:fillColor="#FFFFFF" android:pathData="M24,44 L84,44 L80,30 L28,30 Z"/>
+            <path android:fillColor="#FFFFFF" android:pathData="M28,48 L80,48 L80,82 L28,82 Z"/>
+            <path android:fillColor="#0F766E" android:pathData="M38,58 L50,58 L50,82 L38,82 Z"/>
+            <path android:fillColor="#0F766E" android:pathData="M57,58 L72,58 L72,69 L57,69 Z"/>
+            <path android:fillColor="#FFFFFF" android:pathData="M20,44 L88,44 L82,52 L26,52 Z"/>
+          </vector>
+          XML
+          cat > build_app/android/app/src/main/res/values/colors.xml <<'XML'
+          <resources><color name="launcher_background">#0F766E</color></resources>
+          XML
+          cat > build_app/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'XML'
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@color/launcher_background"/>
+            <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+          cp build_app/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml build_app/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+
+      - name: Dependencies
+        working-directory: build_app
+        run: flutter pub get
+
+      - name: Analyze
+        working-directory: build_app
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Tests
+        working-directory: build_app
+        run: flutter test
+
+      - name: Build release APK
+        working-directory: build_app
+        run: flutter build apk --release
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p artifact
+          cp build_app/build/app/outputs/flutter-apk/app-release.apk artifact/WARUNG_MADURA_V1.apk
+          cp build_app/README.md artifact/README.txt
+          sha256sum artifact/WARUNG_MADURA_V1.apk > artifact/SHA256.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WARUNG-MADURA-V1-APK
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
