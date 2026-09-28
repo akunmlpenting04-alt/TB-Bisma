@@ -64,6 +64,17 @@ jobs:
           new_clamp = "method=='DEBT'?(debt<=0?state.cartTotal:(debt>state.cartTotal?state.cartTotal:debt)):0"
           s = s.replace(old_clamp, new_clamp)
 
+          for next_class in [
+              "class ExpensesPage",
+              "class ShiftPage",
+              "class ReportsPage",
+              "class AuditPage",
+              "class _Line",
+          ]:
+              needle = "}\\n}\\n\\n" + next_class
+              if needle in s:
+                  s = s.replace(needle, "}\\n\\n" + next_class, 1)
+
           p.write_text(s)
           PY
 
