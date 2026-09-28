@@ -57,6 +57,14 @@ jobs:
           p.write_text('\n'.join(lines) + '\n')
           PY
 
+      - name: Inspect sale database path
+        shell: bash
+        run: |
+          echo "===== sale_items schema/usages ====="
+          grep -n -B25 -A120 "sale_items" build_app/lib/database.dart || true
+          echo "===== checkout/sale methods ====="
+          grep -n -B40 -A180 "checkout\|createSale\|completeSale\|saveSale" build_app/lib/database.dart || true
+
       - name: Apply Android launcher icon
         shell: bash
         run: |
