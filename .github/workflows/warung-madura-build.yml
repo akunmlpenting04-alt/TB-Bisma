@@ -100,9 +100,9 @@ jobs:
               expect(start, greaterThanOrEqualTo(0));
               expect(end, greaterThan(start));
               final block = source.substring(start, end);
-              final parent = block.indexOf("txn.insert('sales'");
-              final child = block.indexOf("txn.insert('sale_items'");
-              final finalize = block.indexOf("txn.update('sales'");
+              final parent = RegExp(r"txn\\.insert\\(\\s*'sales'").firstMatch(block)?.start ?? -1;
+              final child = RegExp(r"txn\\.insert\\(\\s*'sale_items'").firstMatch(block)?.start ?? -1;
+              final finalize = RegExp(r"txn\\.update\\(\\s*'sales'").firstMatch(block)?.start ?? -1;
               expect(parent, greaterThanOrEqualTo(0));
               expect(child, greaterThan(parent));
               expect(finalize, greaterThan(child));
