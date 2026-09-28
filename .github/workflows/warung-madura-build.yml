@@ -39,6 +39,58 @@ jobs:
           cp decoded_src/README.md build_app/README.md
           sed -i 's/android:label="warung_madura"/android:label="Warung Madura"/' build_app/android/app/src/main/AndroidManifest.xml || true
 
+      - name: Patch generated source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path("build_app/lib/main.dart")
+          s = p.read_text()
+
+          old_cash = "]))));});\n    ]);"
+          new_cash = "]))));}),\n    ]);"
+          if old_cash not in s:
+              raise SystemExit("Cashier syntax target not found")
+          s = s.replace(old_cash, new_cash, 1)
+
+          old_debt = ")])))));}).toList()"
+          new_debt = ")]))));}).toList()"
+          if old_debt not in s:
+              raise SystemExit("Debt syntax target not found")
+          s = s.replace(old_debt, new_debt, 1)
+
+          old_clamp = "method=='DEBT'?(debt<=0?state.cartTotal:debt.clamp(0,state.cartTotal)):0"
+          new_clamp = "method=='DEBT'?(debt<=0?state.cartTotal:(debt>state.cartTotal?state.cartTotal:debt)):0"
+          s = s.replace(old_clamp, new_clamp)
+
+          p.write_text(s)
+          PY
+
+          cat > build_app/test/widget_test.dart <<'DART'
+          import 'package:flutter_test/flutter_test.dart';
+          import 'package:warung_madura/models.dart';
+
+          void main() {
+            test('CartLine uses integer Rupiah arithmetic', () {
+              const product = Product(
+                id: 'p1',
+                name: 'Aqua 600ml',
+                category: 'Minuman',
+                baseUnit: 'botol',
+                saleUnit: 'botol',
+                unitFactor: 1,
+                costPrice: 2000,
+                salePrice: 3000,
+                stockBase: 24,
+                minStockBase: 6,
+                consignment: false,
+              );
+              expect(CartLine(product, 3).total, 9000);
+            });
+          }
+          DART
+
       - name: Apply premium Android launcher icon
         shell: bash
         run: |
