@@ -1,4 +1,4 @@
-name: Build WARUNG MADURA V2 APK
+name: Build WARUNG MADURA V2.1 APK
 
 on:
   pull_request:
@@ -175,16 +175,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifact
-          cp build_app/build/app/outputs/flutter-apk/app-release.apk artifact/WARUNG_MADURA_V2.apk
+          cp build_app/build/app/outputs/flutter-apk/app-release.apk artifact/WARUNG_MADURA_V2_1.apk
           cp build_app/README.md artifact/README.txt
           cp -R build_app/docs artifact/docs
           cp -R build_app/supabase artifact/supabase
-          sha256sum artifact/WARUNG_MADURA_V2.apk > artifact/SHA256.txt
+          sha256sum artifact/WARUNG_MADURA_V2_1.apk > artifact/SHA256.txt
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WARUNG-MADURA-V2-APK
+          name: WARUNG-MADURA-V2-1-APK
           path: artifact/
           if-no-files-found: error
           retention-days: 7
