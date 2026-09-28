@@ -1,0 +1,190 @@
+name: Build WARUNG MADURA V2.1 APK
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'warung_madura_build/**'
+      - '.github/workflows/warung-madura-build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Prepare Flutter project
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf build_app decoded_src
+          flutter create build_app --platforms=android --org id.bisma --project-name warung_madura
+          mkdir -p decoded_src
+          cat warung_madura_build/source.part.*.b64 | base64 -d > /tmp/source.tar.xz
+          tar -xJf /tmp/source.tar.xz -C decoded_src
+          cp decoded_src/pubspec.yaml build_app/pubspec.yaml
+          cp decoded_src/analysis_options.yaml build_app/analysis_options.yaml
+          rm -rf build_app/lib build_app/test
+          cp -R decoded_src/lib build_app/lib
+          cp -R decoded_src/test build_app/test
+          cp decoded_src/README.md build_app/README.md
+          mkdir -p build_app/docs build_app/supabase
+          cp -R decoded_src/docs/. build_app/docs/ || true
+          cp -R decoded_src/supabase/. build_app/supabase/ || true
+          sed -i 's/android:label="warung_madura"/android:label="Warung Madura"/' build_app/android/app/src/main/AndroidManifest.xml || true
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' build_app/android/app/build.gradle.kts || true
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('build_app/lib/main.dart')
+          src = p.read_text()
+          lines = src.splitlines()
+          fixed = False
+          for i, line in enumerate(lines):
+              if '...moves.take(15).map' in line and line.rstrip().endswith('))),'):
+                  lines[i] = line.rstrip()[:-1] + '),' 
+                  fixed = True
+          if not fixed:
+              print('Reports movement syntax patch not needed or target changed')
+          p.write_text('\n'.join(lines) + '\n')
+          PY
+
+      - name: Fix sale FK ordering
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('build_app/lib/database.dart')
+          s = p.read_text()
+
+          start = s.index('Future<void> createSale(')
+          end = s.index('Future<void> _consumeBatches', start)
+          block = s[start:end]
+
+          old_loop_start = """      var total=0,cogs=0,liability=0;
+      for(final line in items){"""
+          new_loop_start = """      var total=0,cogs=0,liability=0;
+      // Insert the parent sale first so sale_items FK is valid inside this transaction.
+      // Totals are finalized with UPDATE after all item calculations succeed.
+      await txn.insert('sales',{
+        'id':saleId,
+        'total':0,
+        'cogs':0,
+        'payment_method':paymentMethod,
+        'debt_amount':0,
+        'actor':actor,
+        'created_at':now,
+      });
+      for(final line in items){"""
+          if old_loop_start not in block:
+              raise SystemExit('createSale loop anchor not found')
+          block = block.replace(old_loop_start, new_loop_start, 1)
+
+          old_insert = """      await txn.insert('sales',{'id':saleId,'total':total,'cogs':cogs,'payment_method':paymentMethod,'debt_amount':debt,'actor':actor,'created_at':now});"""
+          new_update = """      await txn.update('sales',{
+        'total':total,
+        'cogs':cogs,
+        'payment_method':paymentMethod,
+        'debt_amount':debt,
+      },where:'id=?',whereArgs:[saleId]);"""
+          if old_insert not in block:
+              raise SystemExit('final sales insert anchor not found')
+          block = block.replace(old_insert, new_update, 1)
+
+          s = s[:start] + block + s[end:]
+          p.write_text(s)
+          PY
+
+          cat > build_app/test/sale_fk_order_test.dart <<'DART'
+          import 'dart:io';
+          import 'package:flutter_test/flutter_test.dart';
+
+          void main() {
+            test('sale parent is created before sale_items children', () {
+              final source = File('lib/database.dart').readAsStringSync();
+              final start = source.indexOf('Future<void> createSale(');
+              final end = source.indexOf('Future<void> _consumeBatches', start);
+              expect(start, greaterThanOrEqualTo(0));
+              expect(end, greaterThan(start));
+              final block = source.substring(start, end);
+              final parent = block.indexOf("txn.insert('sales'");
+              final child = block.indexOf("txn.insert('sale_items'");
+              final finalize = block.indexOf("txn.update('sales'");
+              expect(parent, greaterThanOrEqualTo(0));
+              expect(child, greaterThan(parent));
+              expect(finalize, greaterThan(child));
+            });
+          }
+          DART
+
+      - name: Apply Android launcher icon
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p build_app/android/app/src/main/res/drawable build_app/android/app/src/main/res/mipmap-anydpi-v26 build_app/android/app/src/main/res/values
+          cat > build_app/android/app/src/main/res/drawable/ic_launcher_foreground.xml <<'XML'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+            <path android:fillColor="#FFFFFF" android:pathData="M24,44 L84,44 L80,30 L28,30 Z"/>
+            <path android:fillColor="#FFFFFF" android:pathData="M28,48 L80,48 L80,82 L28,82 Z"/>
+            <path android:fillColor="#0F766E" android:pathData="M38,58 L50,58 L50,82 L38,82 Z"/>
+            <path android:fillColor="#0F766E" android:pathData="M57,58 L72,58 L72,69 L57,69 Z"/>
+            <path android:fillColor="#FFFFFF" android:pathData="M20,44 L88,44 L82,52 L26,52 Z"/>
+          </vector>
+          XML
+          cat > build_app/android/app/src/main/res/values/colors.xml <<'XML'
+          <resources><color name="launcher_background">#0F766E</color></resources>
+          XML
+          cat > build_app/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'XML'
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@color/launcher_background"/>
+            <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+          cp build_app/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml build_app/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+
+      - name: Dependencies
+        working-directory: build_app
+        run: flutter pub get
+
+      - name: Format
+        working-directory: build_app
+        run: dart format .
+
+      - name: Analyze
+        working-directory: build_app
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Tests
+        working-directory: build_app
+        run: flutter test
+
+      - name: Build release APK
+        working-directory: build_app
+        run: flutter build apk --release
+
+      - name: Prepare artifact
+        shell: bash
+        run: |
+          mkdir -p artifact
+          cp build_app/build/app/outputs/flutter-apk/app-release.apk artifact/WARUNG_MADURA_V2_1.apk
+          cp build_app/README.md artifact/README.txt
+          cp -R build_app/docs artifact/docs
+          cp -R build_app/supabase artifact/supabase
+          sha256sum artifact/WARUNG_MADURA_V2_1.apk > artifact/SHA256.txt
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WARUNG-MADURA-V2-1-APK
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 7
