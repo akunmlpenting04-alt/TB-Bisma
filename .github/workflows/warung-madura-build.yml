@@ -1,4 +1,4 @@
-name: Build WARUNG MADURA APK
+name: Build WARUNG MADURA V2 APK
 
 on:
   pull_request:
@@ -29,80 +29,21 @@ jobs:
           rm -rf build_app decoded_src
           flutter create build_app --platforms=android --org id.bisma --project-name warung_madura
           mkdir -p decoded_src
-          cat warung_madura_build/source.part.*.b64 | base64 -d > /tmp/source.tar.gz
-          tar -xzf /tmp/source.tar.gz -C decoded_src
+          cat warung_madura_build/source.part.*.b64 | base64 -d > /tmp/source.tar.xz
+          tar -xJf /tmp/source.tar.xz -C decoded_src
           cp decoded_src/pubspec.yaml build_app/pubspec.yaml
           cp decoded_src/analysis_options.yaml build_app/analysis_options.yaml
           rm -rf build_app/lib build_app/test
           cp -R decoded_src/lib build_app/lib
           cp -R decoded_src/test build_app/test
           cp decoded_src/README.md build_app/README.md
+          mkdir -p build_app/docs build_app/supabase
+          cp -R decoded_src/docs/. build_app/docs/ || true
+          cp -R decoded_src/supabase/. build_app/supabase/ || true
           sed -i 's/android:label="warung_madura"/android:label="Warung Madura"/' build_app/android/app/src/main/AndroidManifest.xml || true
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' build_app/android/app/build.gradle.kts || true
 
-      - name: Patch generated source
-        shell: bash
-        run: |
-          set -euxo pipefail
-          python - <<'PY'
-          from pathlib import Path
-          p = Path("build_app/lib/main.dart")
-          s = p.read_text()
-
-          old_cash = "]))));});\n    ]);"
-          new_cash = "]))));}),\n    ]);"
-          if old_cash not in s:
-              raise SystemExit("Cashier syntax target not found")
-          s = s.replace(old_cash, new_cash, 1)
-
-          old_debt = ")])))));}).toList()"
-          new_debt = ")]))));}).toList()"
-          if old_debt not in s:
-              raise SystemExit("Debt syntax target not found")
-          s = s.replace(old_debt, new_debt, 1)
-
-          old_clamp = "method=='DEBT'?(debt<=0?state.cartTotal:debt.clamp(0,state.cartTotal)):0"
-          new_clamp = "method=='DEBT'?(debt<=0?state.cartTotal:(debt>state.cartTotal?state.cartTotal:debt)):0"
-          s = s.replace(old_clamp, new_clamp)
-
-          for next_class in [
-              "class ExpensesPage",
-              "class ShiftPage",
-              "class ReportsPage",
-              "class AuditPage",
-              "class _Line",
-          ]:
-              needle = "}\n}\n\n" + next_class
-              if needle in s:
-                  s = s.replace(needle, "}\n\n" + next_class, 1)
-
-          p.write_text(s)
-          PY
-
-          cat > build_app/test/widget_test.dart <<'DART'
-          import 'package:flutter_test/flutter_test.dart';
-          import 'package:warung_madura/models.dart';
-
-          void main() {
-            test('CartLine uses integer Rupiah arithmetic', () {
-              const product = Product(
-                id: 'p1',
-                name: 'Aqua 600ml',
-                category: 'Minuman',
-                baseUnit: 'botol',
-                saleUnit: 'botol',
-                unitFactor: 1,
-                costPrice: 2000,
-                salePrice: 3000,
-                stockBase: 24,
-                minStockBase: 6,
-                consignment: false,
-              );
-              expect(CartLine(product, 3).total, 9000);
-            });
-          }
-          DART
-
-      - name: Apply premium Android launcher icon
+      - name: Apply Android launcher icon
         shell: bash
         run: |
           set -euxo pipefail
@@ -131,6 +72,10 @@ jobs:
         working-directory: build_app
         run: flutter pub get
 
+      - name: Format
+        working-directory: build_app
+        run: dart format .
+
       - name: Analyze
         working-directory: build_app
         run: flutter analyze --no-fatal-infos --no-fatal-warnings
@@ -147,14 +92,16 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifact
-          cp build_app/build/app/outputs/flutter-apk/app-release.apk artifact/WARUNG_MADURA_V1.apk
+          cp build_app/build/app/outputs/flutter-apk/app-release.apk artifact/WARUNG_MADURA_V2.apk
           cp build_app/README.md artifact/README.txt
-          sha256sum artifact/WARUNG_MADURA_V1.apk > artifact/SHA256.txt
+          cp -R build_app/docs artifact/docs
+          cp -R build_app/supabase artifact/supabase
+          sha256sum artifact/WARUNG_MADURA_V2.apk > artifact/SHA256.txt
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WARUNG-MADURA-V1-APK
+          name: WARUNG-MADURA-V2-APK
           path: artifact/
           if-no-files-found: error
           retention-days: 7
