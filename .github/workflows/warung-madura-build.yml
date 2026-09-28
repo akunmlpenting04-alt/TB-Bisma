@@ -171,3 +171,124 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 7
+
+
+  package_v2_source:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact V2 source commit
+        uses: actions/checkout@v4
+        with:
+          ref: acf38e6b04877f4fb5e556d3a7668f41fe4d0378
+
+      - name: Setup Flutter stable
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Reconstruct exact V2 Flutter project
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf WARUNG_MADURA_V2_SOURCE decoded_src
+          flutter create WARUNG_MADURA_V2_SOURCE --platforms=android --org id.bisma --project-name warung_madura
+          mkdir -p decoded_src
+          cat warung_madura_build/source.part.*.b64 | base64 -d > /tmp/source.tar.xz
+          tar -xJf /tmp/source.tar.xz -C decoded_src
+
+          cp decoded_src/pubspec.yaml WARUNG_MADURA_V2_SOURCE/pubspec.yaml
+          cp decoded_src/analysis_options.yaml WARUNG_MADURA_V2_SOURCE/analysis_options.yaml
+          rm -rf WARUNG_MADURA_V2_SOURCE/lib WARUNG_MADURA_V2_SOURCE/test
+          cp -R decoded_src/lib WARUNG_MADURA_V2_SOURCE/lib
+          cp -R decoded_src/test WARUNG_MADURA_V2_SOURCE/test
+          cp decoded_src/README.md WARUNG_MADURA_V2_SOURCE/README.md
+
+          if [ -d decoded_src/assets ]; then
+            rm -rf WARUNG_MADURA_V2_SOURCE/assets
+            cp -R decoded_src/assets WARUNG_MADURA_V2_SOURCE/assets
+          fi
+          mkdir -p WARUNG_MADURA_V2_SOURCE/docs WARUNG_MADURA_V2_SOURCE/supabase
+          cp -R decoded_src/docs/. WARUNG_MADURA_V2_SOURCE/docs/ || true
+          cp -R decoded_src/supabase/. WARUNG_MADURA_V2_SOURCE/supabase/ || true
+
+          sed -i 's/android:label="warung_madura"/android:label="Warung Madura"/' WARUNG_MADURA_V2_SOURCE/android/app/src/main/AndroidManifest.xml || true
+          sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' WARUNG_MADURA_V2_SOURCE/android/app/build.gradle.kts || true
+
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('WARUNG_MADURA_V2_SOURCE/lib/main.dart')
+          src = p.read_text()
+          lines = src.splitlines()
+          for i, line in enumerate(lines):
+              if '...moves.take(15).map' in line and line.rstrip().endswith('))),'):
+                  lines[i] = line.rstrip()[:-1] + '),'
+          p.write_text('\n'.join(lines) + '\n')
+          PY
+
+          mkdir -p WARUNG_MADURA_V2_SOURCE/android/app/src/main/res/drawable WARUNG_MADURA_V2_SOURCE/android/app/src/main/res/mipmap-anydpi-v26 WARUNG_MADURA_V2_SOURCE/android/app/src/main/res/values
+          cat > WARUNG_MADURA_V2_SOURCE/android/app/src/main/res/drawable/ic_launcher_foreground.xml <<'XML'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+            <path android:fillColor="#FFFFFF" android:pathData="M24,44 L84,44 L80,30 L28,30 Z"/>
+            <path android:fillColor="#FFFFFF" android:pathData="M28,48 L80,48 L80,82 L28,82 Z"/>
+            <path android:fillColor="#0F766E" android:pathData="M38,58 L50,58 L50,82 L38,82 Z"/>
+            <path android:fillColor="#0F766E" android:pathData="M57,58 L72,58 L72,69 L57,69 Z"/>
+            <path android:fillColor="#FFFFFF" android:pathData="M20,44 L88,44 L82,52 L26,52 Z"/>
+          </vector>
+          XML
+          cat > WARUNG_MADURA_V2_SOURCE/android/app/src/main/res/values/colors.xml <<'XML'
+          <resources><color name="launcher_background">#0F766E</color></resources>
+          XML
+          cat > WARUNG_MADURA_V2_SOURCE/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'XML'
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+            <background android:drawable="@color/launcher_background"/>
+            <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+          </adaptive-icon>
+          XML
+          cp WARUNG_MADURA_V2_SOURCE/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml WARUNG_MADURA_V2_SOURCE/android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+
+          cd WARUNG_MADURA_V2_SOURCE
+          flutter pub get
+          dart format .
+
+          cat > BUILD_ORIGIN.md <<'EOF'
+          # WARUNG MADURA V2 source origin
+
+          This project reconstructs the exact Flutter source path used for the successful WARUNG_MADURA_V2.apk build.
+
+          - GitHub Actions source commit: acf38e6b04877f4fb5e556d3a7668f41fe4d0378
+          - Successful workflow run: 36391069667
+          - Package/applicationId: id.bisma.warung_madura
+          - Flutter project name: warung_madura
+
+          ## Build
+          flutter pub get
+          flutter analyze --no-fatal-infos --no-fatal-warnings
+          flutter test
+          flutter build apk --release
+
+          Output:
+          build/app/outputs/flutter-apk/app-release.apk
+          EOF
+
+      - name: Verify package id and required source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          grep -R "id.bisma.warung_madura" WARUNG_MADURA_V2_SOURCE/android/app/build.gradle.kts WARUNG_MADURA_V2_SOURCE/android/app/src/main/AndroidManifest.xml || true
+          test -d WARUNG_MADURA_V2_SOURCE/lib
+          test -d WARUNG_MADURA_V2_SOURCE/android
+          test -f WARUNG_MADURA_V2_SOURCE/pubspec.yaml
+          test -f WARUNG_MADURA_V2_SOURCE/pubspec.lock
+          test -f WARUNG_MADURA_V2_SOURCE/lib/database.dart
+
+      - name: Upload exact V2 source
+        uses: actions/upload-artifact@v4
+        with:
+          name: WARUNG-MADURA-V2-SOURCE
+          path: WARUNG_MADURA_V2_SOURCE/
+          if-no-files-found: error
+          retention-days: 7
