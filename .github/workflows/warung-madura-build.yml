@@ -42,6 +42,20 @@ jobs:
           cp -R decoded_src/supabase/. build_app/supabase/ || true
           sed -i 's/android:label="warung_madura"/android:label="Warung Madura"/' build_app/android/app/src/main/AndroidManifest.xml || true
           sed -i 's/minSdk = flutter.minSdkVersion/minSdk = 23/' build_app/android/app/build.gradle.kts || true
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('build_app/lib/main.dart')
+          src = p.read_text()
+          lines = src.splitlines()
+          fixed = False
+          for i, line in enumerate(lines):
+              if '...moves.take(15).map' in line and line.rstrip().endswith('))),'):
+                  lines[i] = line.rstrip()[:-1] + '),' 
+                  fixed = True
+          if not fixed:
+              print('Reports movement syntax patch not needed or target changed')
+          p.write_text('\\n'.join(lines) + '\\n')
+          PY
 
       - name: Apply Android launcher icon
         shell: bash
