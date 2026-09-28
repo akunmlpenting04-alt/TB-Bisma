@@ -54,7 +54,7 @@ jobs:
                   fixed = True
           if not fixed:
               print('Reports movement syntax patch not needed or target changed')
-          p.write_text('\\n'.join(lines) + '\\n')
+          p.write_text('\n'.join(lines) + '\n')
           PY
 
       - name: Apply Android launcher icon
