@@ -1,0 +1,846 @@
+diff -ruN a/docs/V2_NOTES.md b/docs/V2_NOTES.md
+--- a/docs/V2_NOTES.md	2026-09-28 08:48:46.000000000 +0000
++++ b/docs/V2_NOTES.md	2026-09-29 01:00:54.878889041 +0000
+@@ -10,3 +10,14 @@
+ 
+ ## Sync
+ Setiap transaksi penting menambah event unik ke `sync_queue`. Supabase upsert memakai `operation_id` sebagai idempotency key. Backend production tetap membutuhkan RLS berbasis membership toko.
++
++
++## V2.2 reliability fixes
++- Fixed sale foreign-key ordering: the sales parent row is inserted before sale_items.
++- Added sale_payments ledger so paid-now + debt always equals the sale total.
++- Partial debt supports Cash or QRIS for the amount paid immediately.
++- Shift expected cash is calculated from the CASH payment ledger.
++- Consignment liability is treated as COGS for gross-profit calculation.
++- Weighted-average inventory cost uses integer arithmetic and exact purchase totals.
++- Checkout recalculates price, unit factor, stock, and cost from current database rows.
++- Backup version 3 includes sale_payments and settings.
+diff -ruN a/lib/app_state.dart b/lib/app_state.dart
+--- a/lib/app_state.dart	2026-09-28 08:48:46.000000000 +0000
++++ b/lib/app_state.dart	2026-09-29 00:59:14.859880526 +0000
+@@ -105,13 +105,16 @@
+   }
+ 
+   Future<void> checkout(String payment,
+-      {int debtAmount = 0, String? customer}) async {
++      {int debtAmount = 0,
++      String? customer,
++      String debtPaidMethod = 'CASH'}) async {
+     await db.createSale(
+       items: cart,
+       paymentMethod: payment,
+       debtAmount: debtAmount,
+       actor: actor,
+       customerName: customer,
++      debtPaidMethod: debtPaidMethod,
+     );
+     cart = const [];
+     await refresh();
+diff -ruN a/lib/database.dart b/lib/database.dart
+--- a/lib/database.dart	2026-09-28 08:48:46.000000000 +0000
++++ b/lib/database.dart	2026-09-29 01:00:14.437426705 +0000
+@@ -6,6 +6,7 @@
+ import 'package:uuid/uuid.dart';
+ 
+ import 'models.dart';
++import 'money_math.dart';
+ 
+ class AppDatabase {
+   static final AppDatabase instance = AppDatabase._();
+@@ -19,7 +20,7 @@
+     final root = await getDatabasesPath();
+     _db = await openDatabase(
+       join(root, 'warung_madura_v1.db'),
+-      version: 2,
++      version: 3,
+       onCreate: _create,
+       onUpgrade: _upgrade,
+       onConfigure: (d) async => d.execute('PRAGMA foreign_keys = ON'),
+@@ -114,6 +115,21 @@
+     await d.execute('CREATE INDEX idx_sales_created ON sales(created_at)');
+ 
+     await d.execute('''
++      CREATE TABLE sale_payments(
++        id TEXT PRIMARY KEY,
++        sale_id TEXT NOT NULL,
++        method TEXT NOT NULL,
++        amount INTEGER NOT NULL CHECK(amount >= 0),
++        created_at TEXT NOT NULL,
++        FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE CASCADE
++      )
++    ''');
++    await d.execute(
++        'CREATE INDEX idx_sale_payments_sale ON sale_payments(sale_id)');
++    await d.execute(
++        'CREATE INDEX idx_sale_payments_method ON sale_payments(method, created_at)');
++
++    await d.execute('''
+       CREATE TABLE sale_items(
+         id TEXT PRIMARY KEY,
+         sale_id TEXT NOT NULL,
+@@ -362,6 +378,42 @@
+         }
+       }
+     }
++    if (oldVersion < 3) {
++      Future<void> safeV3(String sql) async {
++        try {
++          await d.execute(sql);
++        } catch (_) {}
++      }
++
++      await safeV3("CREATE TABLE sale_payments(id TEXT PRIMARY KEY,sale_id TEXT NOT NULL,method TEXT NOT NULL,amount INTEGER NOT NULL CHECK(amount >= 0),created_at TEXT NOT NULL,FOREIGN KEY(sale_id) REFERENCES sales(id) ON DELETE CASCADE)");
++      await safeV3(
++          'CREATE INDEX idx_sale_payments_sale ON sale_payments(sale_id)');
++      await safeV3(
++          'CREATE INDEX idx_sale_payments_method ON sale_payments(method, created_at)');
++
++      final existingSales = await d.query('sales');
++      for (final sale in existingSales) {
++        final total = (sale['total'] as num).toInt();
++        final debt = ((sale['debt_amount'] ?? 0) as num).toInt();
++        final paid = SaleMath.paidNow(total: total, debt: debt);
++        if (paid <= 0) continue;
++        final saleId = sale['id'] as String;
++        final count = Sqflite.firstIntValue(await d.rawQuery(
++                'SELECT COUNT(*) FROM sale_payments WHERE sale_id=?',
++                [saleId])) ??
++            0;
++        if (count > 0) continue;
++        var method = (sale['payment_method'] as String?) ?? 'CASH';
++        if (method == 'DEBT') method = 'CASH';
++        await d.insert('sale_payments', {
++          'id': _uuid.v4(),
++          'sale_id': saleId,
++          'method': method,
++          'amount': paid,
++          'created_at': sale['created_at'] as String,
++        });
++      }
++    }
+   }
+ 
+   Future<void> _seedSecurity(Database d) async {
+@@ -708,13 +760,14 @@
+           .first;
+       final before = (fresh['stock_base'] as num).toInt();
+       final oldCost = (fresh['cost_price'] as num).toInt();
+-      final purchaseBase = unit.factor <= 0
+-          ? unit.purchasePrice
+-          : (unit.purchasePrice / unit.factor).round();
+       final after = before + qtyBase;
+-      final newCost = after <= 0
+-          ? oldCost
+-          : ((before * oldCost + qtyBase * purchaseBase) / after).round();
++      final newCost = SaleMath.weightedAverageCost(
++        oldQtyBase: before,
++        oldCostPerBase: oldCost,
++        incomingQty: qty,
++        incomingUnitCost: unit.purchasePrice,
++        incomingFactor: unit.factor,
++      );
+       await txn.update('products',
+           {'stock_base': after, 'cost_price': newCost, 'updated_at': now},
+           where: 'id=?', whereArgs: [p.id]);
+@@ -862,83 +915,183 @@
+       required String paymentMethod,
+       required int debtAmount,
+       required String actor,
+-      String? customerName}) async {
++      String? customerName,
++      String debtPaidMethod = 'CASH'}) async {
+     if (items.isEmpty) return;
++    if (!{'CASH', 'QRIS', 'DEBT'}.contains(paymentMethod)) {
++      throw ArgumentError('Metode pembayaran tidak valid');
++    }
++    if (!{'CASH', 'QRIS'}.contains(debtPaidMethod)) {
++      debtPaidMethod = 'CASH';
++    }
++
+     final d = await db;
+     final now = DateTime.now().toIso8601String();
+     final saleId = _uuid.v4();
++
+     await d.transaction((txn) async {
+-      var total = 0, cogs = 0, liability = 0;
++      await txn.insert('sales', {
++        'id': saleId,
++        'total': 0,
++        'cogs': 0,
++        'payment_method': paymentMethod,
++        'debt_amount': 0,
++        'actor': actor,
++        'created_at': now,
++      });
++
++      var total = 0;
++      var cogs = 0;
++      var liability = 0;
++      final queueItems = <Map<String, Object?>>[];
++
+       for (final line in items) {
+-        final current = (await txn.query('products',
+-                where: 'id=?', whereArgs: [line.product.id], limit: 1))
+-            .first;
++        if (line.qty <= 0) {
++          throw StateError('Jumlah ${line.product.name} tidak valid');
++        }
++
++        final productRows = await txn.query(
++          'products',
++          where: 'id=? AND active=1',
++          whereArgs: [line.product.id],
++          limit: 1,
++        );
++        if (productRows.isEmpty) {
++          throw StateError('Barang ${line.product.name} sudah tidak tersedia');
++        }
++        final current = productRows.first;
++
++        final unitRows = await txn.query(
++          'product_units',
++          where: 'id=? AND product_id=?',
++          whereArgs: [line.unit.id, line.product.id],
++          limit: 1,
++        );
++        if (unitRows.isEmpty) {
++          throw StateError('Satuan ${line.unit.name} sudah tidak valid');
++        }
++        final unitRow = unitRows.first;
++        final factor = (unitRow['factor'] as num).toInt();
++        final unitPrice = (unitRow['sale_price'] as num).toInt();
++        if (factor <= 0 || unitPrice < 0) {
++          throw StateError('Konfigurasi satuan ${line.unit.name} tidak valid');
++        }
++
++        final qtyBase = SaleMath.quantityBase(factor: factor, qty: line.qty);
++        final lineTotal = SaleMath.lineTotal(unitPrice: unitPrice, qty: line.qty);
+         final stock = (current['stock_base'] as num).toInt();
+-        if (stock < line.qtyBase)
+-          throw StateError('Stok ${line.product.name} tidak cukup');
+-        total += line.total;
+-        cogs += line.product.costPrice * line.qtyBase;
+-        final lineLiability = line.product.consignment
+-            ? line.product.consignmentOwnerPrice * line.qtyBase
+-            : 0;
++        if (stock < qtyBase) {
++          throw StateError(
++              'Stok ${current['name']} tidak cukup. Butuh $qtyBase ${current['base_unit']}, tersedia $stock.');
++        }
++
++        final isConsignment = (current['consignment'] as num).toInt() == 1;
++        final costPerBase = (current['cost_price'] as num).toInt();
++        final ownerPrice =
++            ((current['consignment_owner_price'] ?? 0) as num).toInt();
++        final lineLiability = isConsignment ? ownerPrice * qtyBase : 0;
++        final lineCogs =
++            isConsignment ? lineLiability : costPerBase * qtyBase;
++
++        total += lineTotal;
++        cogs += lineCogs;
+         liability += lineLiability;
++
+         await txn.update(
+-            'products', {'stock_base': stock - line.qtyBase, 'updated_at': now},
+-            where: 'id=?', whereArgs: [line.product.id]);
+-        if (line.unit.factor > 1) {
+-          final pack = await txn.query('packaging_stock',
+-              where: 'product_id=? AND unit_id=?',
+-              whereArgs: [line.product.id, line.unit.id]);
++          'products',
++          {'stock_base': stock - qtyBase, 'updated_at': now},
++          where: 'id=?',
++          whereArgs: [line.product.id],
++        );
++
++        if (factor > 1) {
++          final pack = await txn.query(
++            'packaging_stock',
++            where: 'product_id=? AND unit_id=?',
++            whereArgs: [line.product.id, line.unit.id],
++          );
+           if (pack.isNotEmpty) {
+-            final n = (pack.first['unopened_qty'] as num).toInt();
+-            if (n > 0)
++            final unopened = (pack.first['unopened_qty'] as num).toInt();
++            if (unopened >= line.qty) {
+               await txn.update('packaging_stock',
+-                  {'unopened_qty': n >= line.qty ? n - line.qty : 0},
++                  {'unopened_qty': unopened - line.qty},
+                   where: 'product_id=? AND unit_id=?',
+                   whereArgs: [line.product.id, line.unit.id]);
++            }
+           }
+         }
+-        await _consumeBatches(txn, line.product.id, line.qtyBase);
++
++        await _consumeBatches(txn, line.product.id, qtyBase);
+         await txn.insert('sale_items', {
+           'id': _uuid.v4(),
+           'sale_id': saleId,
+           'product_id': line.product.id,
+-          'product_name': line.product.name,
+-          'unit_name': line.unit.name,
+-          'unit_factor': line.unit.factor,
++          'product_name': current['name'] as String,
++          'unit_name': unitRow['name'] as String,
++          'unit_factor': factor,
+           'qty': line.qty,
+-          'qty_base': line.qtyBase,
+-          'unit_price': line.unit.salePrice,
+-          'cost_price': line.product.costPrice,
+-          'subtotal': line.total,
+-          'consignment_partner': line.product.consignmentPartner,
++          'qty_base': qtyBase,
++          'unit_price': unitPrice,
++          'cost_price': isConsignment ? ownerPrice : costPerBase,
++          'subtotal': lineTotal,
++          'consignment_partner': current['consignment_partner'] as String?,
+           'consignment_liability': lineLiability
+         });
+         await txn.insert('stock_movements', {
+           'id': _uuid.v4(),
+           'product_id': line.product.id,
+           'type': 'SALE',
+-          'qty_base': -line.qtyBase,
++          'qty_base': -qtyBase,
+           'reference_id': saleId,
+           'actor': actor,
+-          'reason': 'Penjualan ${line.qty} ${line.unit.name}',
++          'reason': 'Penjualan ${line.qty} ${unitRow['name']}',
+           'created_at': now
+         });
++
++        queueItems.add({
++          'product_id': line.product.id,
++          'name': current['name'],
++          'unit': unitRow['name'],
++          'factor': factor,
++          'qty': line.qty,
++          'qty_base': qtyBase,
++          'unit_price': unitPrice,
++          'subtotal': lineTotal,
++        });
+       }
++
+       final debt = paymentMethod == 'DEBT'
+-          ? (debtAmount <= 0
+-              ? total
+-              : (debtAmount > total ? total : debtAmount))
++          ? SaleMath.clampDebt(total: total, requestedDebt: debtAmount)
+           : 0;
+-      await txn.insert('sales', {
+-        'id': saleId,
++      final paid = SaleMath.paidNow(total: total, debt: debt);
++      final paidMethod =
++          paymentMethod == 'DEBT' ? debtPaidMethod : paymentMethod;
++
++      await txn.update('sales', {
+         'total': total,
+         'cogs': cogs,
+         'payment_method': paymentMethod,
+         'debt_amount': debt,
+-        'actor': actor,
+-        'created_at': now
+-      });
++      }, where: 'id=?', whereArgs: [saleId]);
++
++      if (paid > 0) {
++        await txn.insert('sale_payments', {
++          'id': _uuid.v4(),
++          'sale_id': saleId,
++          'method': paidMethod,
++          'amount': paid,
++          'created_at': now,
++        });
++      }
++
+       if (debt > 0) {
+         await txn.insert('debts', {
+           'id': _uuid.v4(),
+@@ -953,37 +1106,28 @@
+           {
+             'total': total,
++            'paid': paid,
++            'debt': debt,
+             'payment': paymentMethod,
++            'paid_method': paidMethod,
++            'cogs': cogs,
++            'gross_profit': total - cogs,
+             'consignment_liability': liability
+           },
+           'Penjualan');
+       await _queue(txn, 'sale', saleId, 'CREATE', {
+         'id': saleId,
+         'total': total,
+         'cogs': cogs,
+         'payment_method': paymentMethod,
++        'paid_method': paidMethod,
++        'paid_amount': paid,
+         'debt_amount': debt,
+         'consignment_liability': liability,
+         'actor': actor,
+         'created_at': now,
+-        'items': items
+-            .map((e) => {
+-                  'product_id': e.product.id,
+-                  'name': e.product.name,
+-                  'unit': e.unit.name,
+-                  'factor': e.unit.factor,
+-                  'qty': e.qty,
+-                  'qty_base': e.qtyBase,
+-                  'subtotal': e.total
+-                })
+-            .toList()
++        'items': queueItems
+       });
+     });
+   }
+@@ -1199,6 +1343,24 @@
+     return d.query('sales', orderBy: 'created_at DESC', limit: limit);
+   }
+ 
++  Future<Map<String, int>> paymentBreakdown({String? day}) async {
++    final d = await db;
++    final targetDay =
++        day ?? DateTime.now().toIso8601String().substring(0, 10);
++    final rows = await d.rawQuery(
++      '''SELECT sp.method,COALESCE(SUM(sp.amount),0) amount
++         FROM sale_payments sp
++         JOIN sales s ON s.id=sp.sale_id
++         WHERE substr(s.created_at,1,10)=?
++         GROUP BY sp.method''',
++      [targetDay],
++    );
++    final result = <String, int>{'CASH': 0, 'QRIS': 0};
++    for (final row in rows) {
++      result[row['method'] as String] = (row['amount'] as num).toInt();
++    }
++    return result;
++  }
++
+   Future<DashboardSummary> summary() async {
+     final d = await db;
+     final day = DateTime.now().toIso8601String().substring(0, 10);
+@@ -1279,7 +1441,7 @@
+             .first;
+     final opened = shift['opened_at'] as String;
+     final cash = (await d.rawQuery(
+-            "SELECT COALESCE(SUM(total-debt_amount),0) v FROM sales WHERE actor=? AND created_at>=? AND payment_method='CASH'",
++            "SELECT COALESCE(SUM(sp.amount),0) v FROM sale_payments sp JOIN sales s ON s.id=sp.sale_id WHERE s.actor=? AND s.created_at>=? AND sp.method='CASH'",
+             [actor, opened]))
+         .first;
+     final exp = (await d.rawQuery(
+@@ -1375,6 +1537,7 @@
+       'stock_movements',
+       'sales',
+       'sale_items',
++      'sale_payments',
+       'expenses',
+       'debts',
+       'debt_payments',
+@@ -1387,7 +1550,7 @@
+       'settings'
+     ];
+     final data = <String, Object?>{
+-      'version': 2,
++      'version': 3,
+       'exported_at': DateTime.now().toIso8601String()
+     };
+     for (final t in tables) {
+@@ -1406,6 +1569,7 @@
+       'stock_movements',
+       'sales',
+       'sale_items',
++      'sale_payments',
+       'expenses',
+       'debts',
+       'debt_payments',
+@@ -1415,7 +1579,8 @@
+       'purchases',
+       'purchase_items',
+       'inventory_batches',
+-      'consignment_settlements'
++      'consignment_settlements',
++      'settings'
+     ];
+     var inserted = 0;
+     await d.transaction((txn) async {
+diff -ruN a/lib/main.dart b/lib/main.dart
+--- a/lib/main.dart	2026-09-28 08:48:46.000000000 +0000
++++ b/lib/main.dart	2026-09-29 01:00:38.839353996 +0000
+@@ -8,6 +8,7 @@
+ import 'app_state.dart';
+ import 'database.dart';
+ import 'models.dart';
++import 'money_math.dart';
+ 
+ void main() async {
+   WidgetsFlutterBinding.ensureInitialized();
+@@ -825,70 +826,126 @@
+     if (widget.state.cart.isEmpty) return;
+     var method = 'CASH';
++    var debtPaidMethod = 'CASH';
+     final customer = TextEditingController();
+     final debt = TextEditingController();
++
+     final ok = await showDialog<bool>(
+       context: context,
+       builder: (ctx) => StatefulBuilder(
+-        builder: (ctx, setD) => AlertDialog(
+-          title: const Text('Pembayaran'),
+-          content: SizedBox(
+-            width: 460,
+-            child: Column(
+-              mainAxisSize: MainAxisSize.min,
+-              crossAxisAlignment: CrossAxisAlignment.stretch,
+-              children: [
+-                Text('Total ${rp(widget.state.cartTotal)}',
+-                    style: const TextStyle(
+-                        fontSize: 23, fontWeight: FontWeight.w900)),
+-                const SizedBox(height: 16),
+-                SegmentedButton<String>(
+-                  segments: const [
+-                    ButtonSegment(value: 'CASH', label: Text('Cash')),
+-                    ButtonSegment(value: 'QRIS', label: Text('QRIS')),
+-                    ButtonSegment(value: 'DEBT', label: Text('Hutang'))
+-                  ],
+-                  selected: {method},
+-                  onSelectionChanged: (v) => setD(() => method = v.first),
+-                ),
+-                if (method == 'DEBT') ...[
+-                  const SizedBox(height: 12),
+-                  TextField(
+-                      controller: customer,
+-                      decoration:
+-                          const InputDecoration(labelText: 'Nama pelanggan')),
+-                  const SizedBox(height: 8),
+-                  TextField(
+-                      controller: debt,
+-                      keyboardType: TextInputType.number,
+-                      decoration: InputDecoration(
+-                          labelText: 'Nominal hutang',
+-                          hintText: rp(widget.state.cartTotal))),
++        builder: (ctx, setD) {
++          final total = widget.state.cartTotal;
++          final requestedDebt =
++              int.tryParse(debt.text.replaceAll('.', '')) ?? 0;
++          final debtValue = method == 'DEBT'
++              ? SaleMath.clampDebt(total: total, requestedDebt: requestedDebt)
++              : 0;
++          final paidNow = SaleMath.paidNow(total: total, debt: debtValue);
++
++          return AlertDialog(
++            title: const Text('Pembayaran'),
++            content: SizedBox(
++              width: 480,
++              child: Column(
++                mainAxisSize: MainAxisSize.min,
++                crossAxisAlignment: CrossAxisAlignment.stretch,
++                children: [
++                  Text('Total ${rp(total)}',
++                      style: const TextStyle(
++                          fontSize: 23, fontWeight: FontWeight.w900)),
++                  const SizedBox(height: 16),
++                  SegmentedButton<String>(
++                    segments: const [
++                      ButtonSegment(value: 'CASH', label: Text('Cash')),
++                      ButtonSegment(value: 'QRIS', label: Text('QRIS')),
++                      ButtonSegment(value: 'DEBT', label: Text('Hutang'))
++                    ],
++                    selected: {method},
++                    onSelectionChanged: (v) => setD(() {
++                      method = v.first;
++                      if (method != 'DEBT') debt.clear();
++                    }),
++                  ),
++                  if (method == 'DEBT') ...[
++                    const SizedBox(height: 12),
++                    TextField(
++                        controller: customer,
++                        decoration:
++                            const InputDecoration(labelText: 'Nama pelanggan')),
++                    const SizedBox(height: 8),
++                    TextField(
++                      controller: debt,
++                      keyboardType: TextInputType.number,
++                      onChanged: (_) => setD(() {}),
++                      decoration: InputDecoration(
++                        labelText: 'Nominal hutang',
++                        hintText: '$total',
++                        helperText:
++                            'Kosong/0 = seluruh ${rp(total)} menjadi hutang',
++                      ),
++                    ),
++                    const SizedBox(height: 10),
++                    Container(
++                      padding: const EdgeInsets.all(12),
++                      decoration: BoxDecoration(
++                        color: const Color(0xFFF4F8F7),
++                        borderRadius: BorderRadius.circular(12),
++                      ),
++                      child: Column(children: [
++                        LineRow('Total belanja', rp(total)),
++                        LineRow('Bayar sekarang', rp(paidNow), bold: true),
++                        LineRow('Masuk hutang', rp(debtValue), bold: true),
++                      ]),
++                    ),
++                    if (paidNow > 0) ...[
++                      const SizedBox(height: 10),
++                      const Text('Pembayaran sekarang lewat',
++                          style: TextStyle(fontWeight: FontWeight.w800)),
++                      const SizedBox(height: 6),
++                      SegmentedButton<String>(
++                        segments: const [
++                          ButtonSegment(value: 'CASH', label: Text('Cash')),
++                          ButtonSegment(value: 'QRIS', label: Text('QRIS')),
++                        ],
++                        selected: {debtPaidMethod},
++                        onSelectionChanged: (v) =>
++                            setD(() => debtPaidMethod = v.first),
++                      ),
++                    ],
++                  ],
+                 ],
+-              ],
++              ),
+             ),
+-          ),
+-          actions: [
+-            TextButton(
+-                onPressed: () => Navigator.pop(ctx, false),
+-                child: const Text('Batal')),
+-            FilledButton(
+-                onPressed: () => Navigator.pop(ctx, true),
+-                child: const Text('Simpan Transaksi')),
+-          ],
+-        ),
++            actions: [
++              TextButton(
++                  onPressed: () => Navigator.pop(ctx, false),
++                  child: const Text('Batal')),
++              FilledButton(
++                  onPressed: () => Navigator.pop(ctx, true),
++                  child: const Text('Simpan Transaksi')),
++            ],
++          );
++        },
+       ),
+     );
++
+     if (ok != true) return;
+     try {
+-      await widget.state.checkout(method,
+-          debtAmount: int.tryParse(debt.text) ?? 0, customer: customer.text);
+-      if (mounted)
++      await widget.state.checkout(
++        method,
++        debtAmount: int.tryParse(debt.text.replaceAll('.', '')) ?? 0,
++        customer: customer.text,
++        debtPaidMethod: debtPaidMethod,
++      );
++      if (mounted) {
+         ScaffoldMessenger.of(context).showSnackBar(
+             const SnackBar(content: Text('Transaksi tersimpan.')));
++      }
+     } catch (e) {
+-      if (mounted)
++      if (mounted) {
+         ScaffoldMessenger.of(context)
+             .showSnackBar(SnackBar(content: Text('Transaksi gagal: $e')));
++      }
+     }
+   }
+ 
+@@ -2210,6 +2266,7 @@
+   List<Map<String, Object?>> sales = [];
+   List<Map<String, Object?>> moves = [];
+   List<Map<String, Object?>> slow = [];
++  Map<String, int> payments = const {'CASH': 0, 'QRIS': 0};
+   int days = 30;
+   @override
+   void initState() {
+@@ -2221,6 +2278,7 @@
+     sales = await widget.state.db.recentSales();
+     moves = await widget.state.db.stockMovements(limit: 50);
+     slow = await widget.state.db.slowStock(days: days);
++    payments = await widget.state.db.paymentBreakdown();
+     if (mounted) setState(() {});
+   }
+ 
+@@ -2230,6 +2288,13 @@
+       subtitle: 'Penjualan, pergerakan stok dan slow/dead stock.',
+       actions: [IconButton(onPressed: load, icon: const Icon(Icons.refresh))],
+       child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
++        Wrap(spacing: 10, runSpacing: 10, children: [
++          _Metric('Cash hari ini', rp(payments['CASH'] ?? 0),
++              Icons.payments_rounded, const Color(0xFF0F766E)),
++          _Metric('QRIS hari ini', rp(payments['QRIS'] ?? 0),
++              Icons.qr_code_2_rounded, const Color(0xFF2563EB)),
++        ]),
++        const SizedBox(height: 18),
+         Text('Slow / Dead Stock',
+             style: Theme.of(context)
+                 .textTheme
+diff -ruN a/lib/models.dart b/lib/models.dart
+--- a/lib/models.dart	2026-09-28 08:48:46.000000000 +0000
++++ b/lib/models.dart	2026-09-29 00:59:14.859760006 +0000
+@@ -1,3 +1,5 @@
++import 'money_math.dart';
++
+ class Product {
+   final String id;
+   final String name;
+@@ -97,8 +99,8 @@
+   const CartLine(this.product, this.unit, this.qty);
+ 
+   CartLine copyWith({int? qty}) => CartLine(product, unit, qty ?? this.qty);
+-  int get total => unit.salePrice * qty;
+-  int get qtyBase => unit.factor * qty;
++  int get total => SaleMath.lineTotal(unitPrice: unit.salePrice, qty: qty);
++  int get qtyBase => SaleMath.quantityBase(factor: unit.factor, qty: qty);
+ }
+ 
+ class DashboardSummary {
+diff -ruN a/lib/money_math.dart b/lib/money_math.dart
+--- a/lib/money_math.dart	1970-01-01 00:00:00.000000000 +0000
++++ b/lib/money_math.dart	2026-09-29 00:59:06.447561997 +0000
+@@ -0,0 +1,69 @@
++class SaleMath {
++  const SaleMath._();
++
++  static int lineTotal({required int unitPrice, required int qty}) {
++    if (unitPrice < 0) {
++      throw ArgumentError.value(unitPrice, 'unitPrice', 'Tidak boleh negatif');
++    }
++    if (qty <= 0) {
++      throw ArgumentError.value(qty, 'qty', 'Harus lebih dari 0');
++    }
++    return unitPrice * qty;
++  }
++
++  static int quantityBase({required int factor, required int qty}) {
++    if (factor <= 0) {
++      throw ArgumentError.value(factor, 'factor', 'Harus lebih dari 0');
++    }
++    if (qty <= 0) {
++      throw ArgumentError.value(qty, 'qty', 'Harus lebih dari 0');
++    }
++    return factor * qty;
++  }
++
++  static int clampDebt({required int total, required int requestedDebt}) {
++    if (total < 0) {
++      throw ArgumentError.value(total, 'total', 'Tidak boleh negatif');
++    }
++    if (requestedDebt <= 0) return total;
++    if (requestedDebt >= total) return total;
++    return requestedDebt;
++  }
++
++  static int paidNow({required int total, required int debt}) {
++    if (total < 0 || debt < 0) {
++      throw ArgumentError('Total dan hutang tidak boleh negatif');
++    }
++    final safeDebt = debt > total ? total : debt;
++    return total - safeDebt;
++  }
++
++  static int weightedAverageCost({
++    required int oldQtyBase,
++    required int oldCostPerBase,
++    required int incomingQty,
++    required int incomingUnitCost,
++    required int incomingFactor,
++  }) {
++    if (oldQtyBase < 0 ||
++        oldCostPerBase < 0 ||
++        incomingQty <= 0 ||
++        incomingUnitCost < 0 ||
++        incomingFactor <= 0) {
++      throw ArgumentError('Nilai persediaan tidak valid');
++    }
++    final incomingQtyBase = incomingQty * incomingFactor;
++    final afterQty = oldQtyBase + incomingQtyBase;
++    if (afterQty == 0) return oldCostPerBase;
++    final inventoryValue =
++        oldQtyBase * oldCostPerBase + incomingQty * incomingUnitCost;
++    return _roundDiv(inventoryValue, afterQty);
++  }
++
++  static int _roundDiv(int numerator, int denominator) {
++    if (denominator <= 0) {
++      throw ArgumentError.value(denominator, 'denominator');
++    }
++    return (numerator + denominator ~/ 2) ~/ denominator;
++  }
++}
+diff -ruN a/pubspec.yaml b/pubspec.yaml
+--- a/pubspec.yaml	2026-09-28 08:48:46.000000000 +0000
++++ b/pubspec.yaml	2026-09-29 00:59:06.447347668 +0000
+@@ -1,7 +1,7 @@
+ name: warung_madura
+-description: Warung Madura V2 offline-first POS, stock, owner monitoring, and security.
++description: Warung Madura V2.2 offline-first POS with corrected transaction math and safer accounting.
+ publish_to: 'none'
+-version: 2.0.0+2
++version: 2.2.0+3
+ 
+ environment:
+   sdk: '>=3.4.0 <4.0.0'
+diff -ruN a/test/widget_test.dart b/test/widget_test.dart
+--- a/test/widget_test.dart	2026-09-28 08:48:46.000000000 +0000
++++ b/test/widget_test.dart	2026-09-29 01:00:54.878642403 +0000
+@@ -1,5 +1,6 @@
+ import 'package:flutter_test/flutter_test.dart';
+ import 'package:warung_madura/models.dart';
++import 'package:warung_madura/money_math.dart';
+ 
+ void main() {
+   const product = Product(
+@@ -64,4 +65,44 @@
+     expect(line.total, 20000);
+     expect(consignment.consignmentOwnerPrice * line.qtyBase, 16000);
+   });
++
++  test('cart addition stays exact for Rupiah', () {
++    expect(68000 + 4000 + 35000, 107000);
++    expect(SaleMath.lineTotal(unitPrice: 68000, qty: 2), 136000);
++    expect(SaleMath.lineTotal(unitPrice: 4000, qty: 3), 12000);
++    expect(136000 + 12000, 148000);
++  });
++
++  test('unit factor changes stock quantity, not selling price multiplication', () {
++    expect(SaleMath.quantityBase(factor: 24, qty: 1), 24);
++    expect(SaleMath.lineTotal(unitPrice: 68000, qty: 1), 68000);
++  });
++
++  test('partial debt always balances exactly', () {
++    const total = 100000;
++    final debt = SaleMath.clampDebt(total: total, requestedDebt: 30000);
++    final paid = SaleMath.paidNow(total: total, debt: debt);
++    expect(debt, 30000);
++    expect(paid, 70000);
++    expect(paid + debt, total);
++  });
++
++  test('full debt when debt field is zero', () {
++    const total = 85000;
++    final debt = SaleMath.clampDebt(total: total, requestedDebt: 0);
++    expect(debt, total);
++    expect(SaleMath.paidNow(total: total, debt: debt), 0);
++  });
++
++  test('weighted average cost uses exact incoming purchase total', () {
++    final avg = SaleMath.weightedAverageCost(
++      oldQtyBase: 24,
++      oldCostPerBase: 2500,
++      incomingQty: 1,
++      incomingUnitCost: 68000,
++      incomingFactor: 24,
++    );
++    expect(avg, 2667);
++  });
++
+ }
