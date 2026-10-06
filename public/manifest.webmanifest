@@ -1,1 +1,9 @@
-{"name":"TB Bisma","short_name":"TB Bisma","start_url":"/","display":"standalone","background_color":"#0d1e3a","theme_color":"#0d1e3a","icons":[{"src":"/assets/icon.png","sizes":"1024x1024","type":"image/png","purpose":"any maskable"}]}
+{
+  "name":"BISMA GROWTH",
+  "short_name":"BISMA GROWTH",
+  "start_url":".",
+  "display":"standalone",
+  "background_color":"#08090b",
+  "theme_color":"#08090b",
+  "description":"20 Skill Mastery - daily learning tracker"
+}
